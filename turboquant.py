@@ -15,7 +15,33 @@ from typing import Optional, Tuple
 from .lloyd_max import LloydMaxCodebook
 
 
-def generate_rotation_matrix(d: int, seed: Optional[int] = None, device: str = "cpu") -> torch.Tensor:
+def resolve_torch_dtype(dtype: torch.dtype | str | None) -> torch.dtype:
+    if dtype is None:
+        return torch.float32
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    mapping = {
+        "float32": torch.float32,
+        "float": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    key = str(dtype).strip().lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return mapping[key]
+
+
+def generate_rotation_matrix(
+    d: int,
+    seed: Optional[int] = None,
+    device: str = "cpu",
+    dtype: torch.dtype | str | None = None,
+) -> torch.Tensor:
     """
     Generate a random orthogonal rotation matrix via QR decomposition of Gaussian matrix.
     This is the Haar-distributed random rotation used in TurboQuant.
@@ -30,10 +56,16 @@ def generate_rotation_matrix(d: int, seed: Optional[int] = None, device: str = "
     diag_sign = torch.sign(torch.diag(R))
     diag_sign[diag_sign == 0] = 1.0
     Q = Q * diag_sign.unsqueeze(0)
-    return Q.to(device)
+    return Q.to(device=device, dtype=resolve_torch_dtype(dtype))
 
 
-def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: Optional[int] = None, device: str = "cpu") -> torch.Tensor:
+def generate_qjl_matrix(
+    d: int,
+    m: Optional[int] = None,
+    seed: Optional[int] = None,
+    device: str = "cpu",
+    dtype: torch.dtype | str | None = None,
+) -> torch.Tensor:
     """
     Generate the random projection matrix S for QJL.
     S has i.i.d. N(0,1) entries, shape (m, d).
@@ -45,7 +77,7 @@ def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: Optional[int] = N
     if seed is not None:
         gen.manual_seed(seed)
     S = torch.randn(m, d, generator=gen)
-    return S.to(device)
+    return S.to(device=device, dtype=resolve_torch_dtype(dtype))
 
 
 class TurboQuantMSE(nn.Module):
@@ -54,14 +86,22 @@ class TurboQuantMSE(nn.Module):
     Randomly rotates, then applies per-coordinate Lloyd-Max quantization.
     """
 
-    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cpu"):
+    def __init__(
+        self,
+        d: int,
+        bits: int,
+        seed: int = 42,
+        device: str = "cpu",
+        dtype: torch.dtype | str | None = None,
+    ):
         super().__init__()
         self.d = d
         self.bits = bits
         self.device = device
+        self.dtype = resolve_torch_dtype(dtype)
 
         # Precompute rotation matrix
-        self.register_buffer("Pi", generate_rotation_matrix(d, seed=seed, device=device))
+        self.register_buffer("Pi", generate_rotation_matrix(d, seed=seed, device=device, dtype=self.dtype))
 
         # Precompute Lloyd-Max codebook
         self.codebook = LloydMaxCodebook(d, bits)
@@ -70,24 +110,24 @@ class TurboQuantMSE(nn.Module):
 
     def rotate(self, x: torch.Tensor) -> torch.Tensor:
         """Apply random rotation: y = Pi @ x."""
-        # x: (batch, d) or (d,)
+        if x.device != self.Pi.device or x.dtype != self.Pi.dtype:
+            x = x.to(device=self.Pi.device, dtype=self.Pi.dtype)
         return x @ self.Pi.T
 
     def unrotate(self, y: torch.Tensor) -> torch.Tensor:
         """Undo rotation: x = Pi^T @ y."""
+        if y.device != self.Pi.device or y.dtype != self.Pi.dtype:
+            y = y.to(device=self.Pi.device, dtype=self.Pi.dtype)
         return y @ self.Pi
 
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize vectors to codebook indices. Returns integer indices."""
         y = self.rotate(x)
-        # Find nearest centroid for each coordinate
-        diffs = y.unsqueeze(-1) - self.centroids  # (..., d, n_levels)
-        indices = diffs.abs().argmin(dim=-1)  # (..., d)
-        return indices
+        return self.codebook.quantize(y)
 
     def dequantize(self, indices: torch.Tensor) -> torch.Tensor:
         """Dequantize indices back to vectors."""
-        y_hat = self.centroids[indices]  # (..., d)
+        y_hat = self.centroids.to(device=indices.device, dtype=self.Pi.dtype)[indices]  # (..., d)
         return self.unrotate(y_hat)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -109,7 +149,15 @@ class TurboQuantProd(nn.Module):
     Effective: ~b bits per dimension (the QJL bit replaces one MSE bit)
     """
 
-    def __init__(self, d: int, bits: int, qjl_dim: Optional[int] = None, seed: int = 42, device: str = "cpu"):
+    def __init__(
+        self,
+        d: int,
+        bits: int,
+        qjl_dim: Optional[int] = None,
+        seed: int = 42,
+        device: str = "cpu",
+        dtype: torch.dtype | str | None = None,
+    ):
         """
         Args:
             d: vector dimension
@@ -124,12 +172,13 @@ class TurboQuantProd(nn.Module):
         self.mse_bits = max(bits - 1, 1)
         self.qjl_dim = qjl_dim or d
         self.device = device
+        self.dtype = resolve_torch_dtype(dtype)
 
         # Stage 1: MSE quantizer with (bits-1) bits
-        self.mse = TurboQuantMSE(d, self.mse_bits, seed=seed, device=device)
+        self.mse = TurboQuantMSE(d, self.mse_bits, seed=seed, device=device, dtype=self.dtype)
 
         # Stage 2: QJL projection matrix
-        self.register_buffer("S", generate_qjl_matrix(d, m=self.qjl_dim, seed=seed + 1, device=device))
+        self.register_buffer("S", generate_qjl_matrix(d, m=self.qjl_dim, seed=seed + 1, device=device, dtype=self.dtype))
 
     def quantize(self, x: torch.Tensor) -> dict:
         """
@@ -140,6 +189,9 @@ class TurboQuantProd(nn.Module):
             - 'qjl_signs': (batch, qjl_dim) sign bits of QJL-projected residual
             - 'residual_norm': (batch,) L2 norm of residual
         """
+        if x.device != self.S.device or x.dtype != self.S.dtype:
+            x = x.to(device=self.S.device, dtype=self.S.dtype)
+
         # Stage 1: MSE quantize
         x_hat, mse_indices = self.mse(x)
 
@@ -149,8 +201,7 @@ class TurboQuantProd(nn.Module):
 
         # Stage 2: QJL - project residual and take sign
         projected = residual @ self.S.T  # (batch, qjl_dim)
-        qjl_signs = torch.sign(projected)  # (batch, qjl_dim)
-        qjl_signs[qjl_signs == 0] = 1.0  # map zeros to +1
+        qjl_signs = torch.where(projected >= 0, torch.ones_like(projected), -torch.ones_like(projected))
 
         return {
             "mse_indices": mse_indices,
@@ -161,6 +212,30 @@ class TurboQuantProd(nn.Module):
     def dequantize(self, compressed: dict) -> torch.Tensor:
         """Dequantize MSE component (for reconstruction)."""
         return self.mse.dequantize(compressed["mse_indices"])
+
+    def materialize_search_index(
+        self,
+        x: torch.Tensor,
+        mse_dtype: torch.dtype | None = None,
+        sign_dtype: torch.dtype | None = None,
+        norm_dtype: torch.dtype | None = None,
+        projection_dtype: torch.dtype | None = None,
+    ) -> dict:
+        compressed = self.quantize(x)
+        x_mse = self.mse.dequantize(compressed["mse_indices"]).to(mse_dtype or self.dtype).contiguous()
+        qjl_signs = compressed["qjl_signs"].to(sign_dtype or self.dtype).contiguous()
+        residual_norm = compressed["residual_norm"].to(norm_dtype or self.dtype).contiguous()
+        correction_scale = math.sqrt(math.pi / 2) / self.qjl_dim
+        weighted_qjl = qjl_signs.to(x_mse.dtype) * (correction_scale * residual_norm.to(x_mse.dtype)).unsqueeze(1)
+        search_matrix = torch.cat([x_mse, weighted_qjl], dim=1).contiguous()
+        return {
+            "k_mse": x_mse,
+            "qjl_signs": qjl_signs,
+            "residual_norm": residual_norm,
+            "projection_matrix": self.S.to(projection_dtype or self.dtype).contiguous(),
+            "correction_scale": correction_scale,
+            "search_matrix": search_matrix,
+        }
 
     def inner_product(self, y: torch.Tensor, compressed: dict) -> torch.Tensor:
         """
@@ -176,20 +251,46 @@ class TurboQuantProd(nn.Module):
         Returns:
             Estimated inner products (batch,)
         """
-        # Term 1: inner product with MSE reconstruction
         x_mse = self.mse.dequantize(compressed["mse_indices"])
-        term1 = (y * x_mse).sum(dim=-1)
+        target_device = x_mse.device
+        target_dtype = x_mse.dtype
 
-        # Term 2: QJL correction
-        # Project query with same S matrix (but don't quantize query)
-        y_projected = y @ self.S.T  # (batch, qjl_dim)
-        qjl_ip = (y_projected * compressed["qjl_signs"]).sum(dim=-1)
+        y_input = y if y.device == target_device and y.dtype == target_dtype else y.to(device=target_device, dtype=target_dtype)
+        signs = compressed["qjl_signs"]
+        if signs.device != target_device or signs.dtype != target_dtype:
+            signs = signs.to(device=target_device, dtype=target_dtype)
+        residual_norm = compressed["residual_norm"]
+        if residual_norm.device != target_device or residual_norm.dtype != target_dtype:
+            residual_norm = residual_norm.to(device=target_device, dtype=target_dtype)
 
-        m = self.qjl_dim
-        correction_scale = math.sqrt(math.pi / 2) / m
-        term2 = compressed["residual_norm"] * correction_scale * qjl_ip
+        y_projected = y_input @ self.S.to(device=target_device, dtype=target_dtype).T
+        correction_scale = math.sqrt(math.pi / 2) / self.qjl_dim
 
-        return term1 + term2
+        if y_input.ndim == x_mse.ndim and y_input.shape == x_mse.shape:
+            term1 = (y_input * x_mse).sum(dim=-1)
+            qjl_ip = (y_projected * signs).sum(dim=-1)
+            term2 = residual_norm * correction_scale * qjl_ip
+            return term1 + term2
+
+        if y_input.ndim == 2 and x_mse.ndim == 2:
+            term1 = torch.matmul(y_input, x_mse.T)
+            qjl_ip = torch.matmul(y_projected, signs.T)
+            term2 = qjl_ip * (correction_scale * residual_norm).unsqueeze(0)
+            return term1 + term2
+
+        if y_input.ndim == 1 and x_mse.ndim == 2:
+            term1 = torch.matmul(x_mse, y_input)
+            qjl_ip = torch.matmul(signs, y_projected)
+            term2 = residual_norm * correction_scale * qjl_ip
+            return term1 + term2
+
+        if y_input.ndim == 2 and x_mse.ndim == 1:
+            term1 = torch.matmul(y_input, x_mse)
+            qjl_ip = torch.matmul(y_projected, signs)
+            term2 = correction_scale * residual_norm * qjl_ip
+            return term1 + term2
+
+        raise ValueError(f"Unsupported shapes for inner_product: y={tuple(y_input.shape)}, x={tuple(x_mse.shape)}")
 
     def forward(self, x: torch.Tensor) -> dict:
         """Quantize input vectors."""

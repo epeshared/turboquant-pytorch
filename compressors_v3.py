@@ -40,7 +40,8 @@ class MSECompressor:
         self.device = device
 
         self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device)
-        self.centroids = LloydMaxCodebook(head_dim, bits).centroids.to(device)
+        self.codebook = LloydMaxCodebook(head_dim, bits)
+        self.centroids = self.codebook.centroids.to(device)
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor) -> dict:
@@ -57,8 +58,7 @@ class MSECompressor:
 
         # Rotate + quantize
         rotated = flat_norm @ self.Pi.T
-        diffs = rotated.unsqueeze(-1) - self.centroids  # (N, D, levels)
-        indices = diffs.abs().argmin(dim=-1).to(torch.uint8)  # (N, D)
+        indices = self.codebook.quantize(rotated).to(torch.uint8)  # (N, D)
 
         # Bit-pack indices: pack multiple indices per byte
         indices_per_byte = 8 // self.bits

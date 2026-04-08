@@ -116,9 +116,9 @@ class LloydMaxCodebook:
 
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize values to nearest centroid indices."""
-        # x: (...,) -> indices: (...,) as uint8/int16
-        diffs = (x.unsqueeze(-1) - self.centroids.to(x.device))  # (..., n_levels)
-        return diffs.abs().argmin(dim=-1)
+        values = x if x.dtype == torch.float32 else x.to(torch.float32)
+        boundaries = self.boundaries.to(values.device)
+        return torch.bucketize(values, boundaries, right=False)
 
     def dequantize(self, indices: torch.Tensor) -> torch.Tensor:
         """Map indices back to centroid values."""

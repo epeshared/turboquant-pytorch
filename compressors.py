@@ -21,6 +21,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from .lloyd_max import LloydMaxCodebook
+from .turboquant import generate_qjl_matrix, generate_rotation_matrix, resolve_torch_dtype
+
 
 class TurboQuantCompressorV2:
     """
@@ -28,28 +31,23 @@ class TurboQuantCompressorV2:
     direct inner product computation without full decompression.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", dtype: torch.dtype | str = torch.float32):
         self.head_dim = head_dim
         self.bits = bits
         self.mse_bits = max(bits - 1, 1)
         self.device = device
+        self.dtype = resolve_torch_dtype(dtype)
 
         # Rotation matrix
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed)
-        G = torch.randn(head_dim, head_dim, generator=gen)
-        Q, R = torch.linalg.qr(G)
-        diag_sign = torch.sign(torch.diag(R))
-        diag_sign[diag_sign == 0] = 1.0
-        self.Pi = (Q * diag_sign.unsqueeze(0)).to(device)
+        self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device, dtype=self.dtype)
 
         # Lloyd-Max codebook
-        self.centroids = self._solve_codebook(head_dim, self.mse_bits).to(device)
+        self.codebook = LloydMaxCodebook(head_dim, self.mse_bits)
+        self.centroids = self.codebook.centroids.to(device)
+        self.boundaries = self.codebook.boundaries.to(device)
 
         # QJL matrix
-        gen2 = torch.Generator(device="cpu")
-        gen2.manual_seed(seed + 10000)
-        self.S = torch.randn(head_dim, head_dim, generator=gen2).to(device)
+        self.S = generate_qjl_matrix(head_dim, m=head_dim, seed=seed + 10000, device=device, dtype=self.dtype)
 
         # Precompute Pi^T for fast dequant
         self.PiT = self.Pi.T.contiguous()
@@ -87,21 +85,18 @@ class TurboQuantCompressorV2:
         Stores everything needed for asymmetric inner product computation.
         """
         B, H, S, D = states.shape
-        flat = states.reshape(-1, D).float()
+        flat = states.reshape(-1, D).to(device=self.Pi.device, dtype=self.Pi.dtype)
 
         # Store original norms
         vec_norms = torch.norm(flat, dim=-1, keepdim=True)  # (N, 1)
         flat_norm = flat / (vec_norms + 1e-8)
 
         # Rotate and quantize
-        rotated = flat_norm @ self.PiT.T  # use Pi, so PiT.T = Pi
-        # Actually: rotated = flat_norm @ self.Pi.T
-        rotated = flat_norm @ self.Pi.T
-        diffs = rotated.unsqueeze(-1) - self.centroids
-        indices = diffs.abs().argmin(dim=-1).to(torch.uint8)
+        rotated = flat_norm @ self.PiT
+        indices = self.codebook.quantize(rotated).to(torch.uint8)
 
         # MSE reconstruction in original space (for inner product term 1)
-        reconstructed_rotated = self.centroids[indices.long()]
+        reconstructed_rotated = self.centroids.to(device=indices.device, dtype=self.Pi.dtype)[indices.long()]
         k_mse = (reconstructed_rotated @ self.Pi) * vec_norms  # (N, D) - back in original scale
 
         # Residual in original space
@@ -110,12 +105,12 @@ class TurboQuantCompressorV2:
 
         # QJL signs of residual
         projected = residual @ self.S.T
-        signs = (projected >= 0).to(torch.int8) * 2 - 1  # {-1, +1} as int8
+        signs = torch.where(projected >= 0, torch.ones_like(projected), -torch.ones_like(projected))
 
         return {
-            "k_mse": k_mse.to(torch.float16).reshape(B, H, S, D),  # MSE reconstruction
-            "qjl_signs": signs.reshape(B, H, S, D),  # QJL sign bits
-            "residual_norm": residual_norm.to(torch.float16).reshape(B, H, S),  # ||r||
+            "k_mse": k_mse.to(self.dtype).reshape(B, H, S, D),
+            "qjl_signs": signs.to(self.dtype).reshape(B, H, S, D),
+            "residual_norm": residual_norm.to(self.dtype).reshape(B, H, S),
             "shape": (B, H, S, D),
         }
 
@@ -134,46 +129,32 @@ class TurboQuantCompressorV2:
         Returns:
             scores: (batch, heads, seq_q, seq_k)
         """
-        k_mse = compressed["k_mse"].float()       # (B, H, S_k, D)
-        signs = compressed["qjl_signs"].float()     # (B, H, S_k, D)
-        r_norm = compressed["residual_norm"].float() # (B, H, S_k)
+        target_dtype = compressed["k_mse"].dtype
+        queries_input = queries.to(device=self.S.device, dtype=target_dtype)
+        k_mse = compressed["k_mse"].to(device=queries_input.device, dtype=target_dtype)
+        signs = compressed["qjl_signs"].to(device=queries_input.device, dtype=target_dtype)
+        r_norm = compressed["residual_norm"].to(device=queries_input.device, dtype=target_dtype)
 
-        # Term 1: Q @ K_mse^T  (standard matmul)
-        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))  # (B, H, S_q, S_k)
-
-        # Term 2: QJL correction
-        # Project queries through S: S @ q for each query
-        # queries: (B, H, S_q, D), S: (D, D)
-        q_projected = torch.matmul(queries.float(), self.S.T)  # (B, H, S_q, D)
-
-        # <S@q, signs_k> for all pairs
-        qjl_ip = torch.matmul(q_projected, signs.transpose(-2, -1))  # (B, H, S_q, S_k)
-
-        # Scale by residual norms and correction factor
-        m = self.S.shape[0]
-        correction_scale = math.sqrt(math.pi / 2) / m
-        # r_norm: (B, H, S_k) -> (B, H, 1, S_k) for broadcasting
-        term2 = correction_scale * qjl_ip * r_norm.unsqueeze(-2)
-
-        return term1 + term2
+        q_projected = torch.matmul(queries_input, self.S.to(device=queries_input.device, dtype=target_dtype).T)
+        correction_scale = math.sqrt(math.pi / 2) / self.S.shape[0]
+        weighted_signs = signs * (correction_scale * r_norm).unsqueeze(-1)
+        query_search = torch.cat([queries_input, q_projected], dim=-1)
+        key_search = torch.cat([k_mse, weighted_signs], dim=-1)
+        return torch.matmul(query_search, key_search.transpose(-2, -1))
 
 
 class TurboQuantCompressorMSE:
     """Simpler MSE-only compressor for values (no QJL needed)."""
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", dtype: torch.dtype | str = torch.float32):
         self.head_dim = head_dim
         self.bits = bits
         self.device = device
+        self.dtype = resolve_torch_dtype(dtype)
 
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(seed)
-        G = torch.randn(head_dim, head_dim, generator=gen)
-        Q, R = torch.linalg.qr(G)
-        diag_sign = torch.sign(torch.diag(R))
-        diag_sign[diag_sign == 0] = 1.0
-        self.Pi = (Q * diag_sign.unsqueeze(0)).to(device)
-        self.centroids = self._solve_codebook(head_dim, bits).to(device)
+        self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device, dtype=self.dtype)
+        self.codebook = LloydMaxCodebook(head_dim, bits)
+        self.centroids = self.codebook.centroids.to(device)
 
     def _solve_codebook(self, d, bits):
         from scipy import integrate
@@ -200,15 +181,14 @@ class TurboQuantCompressorMSE:
     @torch.no_grad()
     def compress(self, states: torch.Tensor) -> dict:
         B, H, S, D = states.shape
-        flat = states.reshape(-1, D).float()
+        flat = states.reshape(-1, D).to(device=self.Pi.device, dtype=self.Pi.dtype)
         vec_norms = torch.norm(flat, dim=-1, keepdim=True)
         flat_norm = flat / (vec_norms + 1e-8)
         rotated = flat_norm @ self.Pi.T
-        diffs = rotated.unsqueeze(-1) - self.centroids
-        indices = diffs.abs().argmin(dim=-1).to(torch.uint8)
+        indices = self.codebook.quantize(rotated).to(torch.uint8)
         return {
             "indices": indices,
-            "vec_norms": vec_norms.squeeze(-1).to(torch.float16),
+            "vec_norms": vec_norms.squeeze(-1).to(self.dtype),
             "shape": (B, H, S, D),
         }
 
@@ -216,8 +196,8 @@ class TurboQuantCompressorMSE:
     def decompress(self, compressed: dict) -> torch.Tensor:
         B, H, S, D = compressed["shape"]
         indices = compressed["indices"].long()
-        reconstructed = self.centroids[indices] @ self.Pi
-        vec_norms = compressed["vec_norms"].float().unsqueeze(-1)
+        reconstructed = self.centroids.to(device=indices.device, dtype=self.Pi.dtype)[indices] @ self.Pi
+        vec_norms = compressed["vec_norms"].to(device=indices.device, dtype=self.Pi.dtype).unsqueeze(-1)
         return (reconstructed * vec_norms).reshape(B, H, S, D)
 
 
