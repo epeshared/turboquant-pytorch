@@ -22,7 +22,7 @@ import math
 from typing import Optional
 
 from .lloyd_max import LloydMaxCodebook
-from .turboquant import generate_rotation_matrix
+from .turboquant import generate_rotation_matrix, resolve_torch_dtype
 
 
 class MSECompressor:
@@ -34,12 +34,13 @@ class MSECompressor:
     quantizes with Lloyd-Max, and stores packed indices + norms.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", dtype: torch.dtype | str | None = None):
         self.head_dim = head_dim
         self.bits = bits
         self.device = device
+        self.dtype = resolve_torch_dtype(dtype)
 
-        self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device)
+        self.Pi = generate_rotation_matrix(head_dim, seed=seed, device=device, dtype=self.dtype)
         self.codebook = LloydMaxCodebook(head_dim, bits)
         self.centroids = self.codebook.centroids.to(device)
 
@@ -50,15 +51,16 @@ class MSECompressor:
         """
         B, H, S, D = states.shape
         N = B * H * S
-        flat = states.reshape(N, D).float()
+        flat = states.reshape(N, D).to(dtype=self.dtype)
 
         # Normalize to unit sphere, store norms
         vec_norms = torch.norm(flat, dim=-1)  # (N,)
         flat_norm = flat / (vec_norms.unsqueeze(-1) + 1e-8)
 
-        # Rotate + quantize
+        # Rotate + quantize (bucketize requires fp32; convert once here to
+        # avoid a redundant cast inside codebook.quantize)
         rotated = flat_norm @ self.Pi.T
-        indices = self.codebook.quantize(rotated).to(torch.uint8)  # (N, D)
+        indices = self.codebook.quantize(rotated.float()).to(torch.uint8)  # (N, D)
 
         # Bit-pack indices: pack multiple indices per byte
         indices_per_byte = 8 // self.bits
@@ -86,7 +88,7 @@ class MSECompressor:
         B, H, S, D = compressed["shape"]
         N = B * H * S
         idx_bytes = compressed["idx_bytes"].reshape(N, -1)
-        vec_norms = compressed["vec_norms"].reshape(N, 1).float()
+        vec_norms = compressed["vec_norms"].reshape(N, 1).to(self.dtype)
         idx_pad = compressed["idx_pad"]
 
         # Unpack indices
@@ -101,7 +103,7 @@ class MSECompressor:
             indices = indices[:, :D]
 
         # Reconstruct
-        reconstructed = (self.centroids[indices] @ self.Pi) * vec_norms
+        reconstructed = (self.centroids.to(self.dtype)[indices] @ self.Pi) * vec_norms
         return reconstructed.reshape(B, H, S, D)
 
     def memory_bytes(self, B: int, H: int, S: int) -> dict:
@@ -149,6 +151,7 @@ class TurboQuantV3:
         protected_bits: int = 8,
         seed: int = 42,
         device: str = "cpu",
+        dtype: torch.dtype | str | None = None,
     ):
         self.head_dim = head_dim
         self.residual_window = residual_window
@@ -163,9 +166,11 @@ class TurboQuantV3:
         self.key_bits = min(effective_key_bits, 8)
         self.value_bits = min(effective_value_bits, 8)
 
+        self.dtype = resolve_torch_dtype(dtype) if dtype is not None else None
+
         seed_base = seed + layer_idx * 1000
-        self.key_compressor = MSECompressor(head_dim, self.key_bits, seed=seed_base, device=device)
-        self.val_compressor = MSECompressor(head_dim, self.value_bits, seed=seed_base + 500, device=device)
+        self.key_compressor = MSECompressor(head_dim, self.key_bits, seed=seed_base, device=device, dtype=dtype)
+        self.val_compressor = MSECompressor(head_dim, self.value_bits, seed=seed_base + 500, device=device, dtype=dtype)
 
     @torch.no_grad()
     def compress_kv(
